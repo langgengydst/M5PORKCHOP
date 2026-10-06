@@ -41,6 +41,8 @@
 #include "unlockables_menu.h"
 #include "bounty_status_menu.h"
 #include "sd_format_menu.h"
+#include "ir_menu.h"
+#include "nrf_menu.h"
 #include "../core/heap_health.h"
 
 // Theme color getters - read from config
@@ -324,6 +326,10 @@ void Display::update() {
             Weather::draw(mainCanvas, COLOR_FG, COLOR_BG);
             // Draw mood bubble LAST so it's always on top
             Mood::draw(mainCanvas);
+            // OINK attack selector overlays everything when open
+            if (mode == PorkchopMode::OINK_MODE) {
+                OinkMode::drawAttackOverlay(mainCanvas);
+            }
             break;
 
         case PorkchopMode::PIGSYNC_DEVICE_SELECT:
@@ -400,6 +406,12 @@ void Display::update() {
             break;
         case PorkchopMode::CHARGING:
             ChargingMode::draw(mainCanvas);
+            break;
+        case PorkchopMode::IR_TOOLS:
+            IrMenu::draw(mainCanvas);
+            break;
+        case PorkchopMode::NRF_TOOLS:
+            NrfMenu::draw(mainCanvas);
             break;
     }
     
@@ -637,6 +649,14 @@ void Display::drawTopBar() {
             snprintf(modeBuf, sizeof(modeBuf), "CHARGING");
             modeColor = COLOR_SUCCESS;
             break;
+        case PorkchopMode::IR_TOOLS:
+            snprintf(modeBuf, sizeof(modeBuf), "1R T00LS");
+            modeColor = COLOR_ACCENT;
+            break;
+        case PorkchopMode::NRF_TOOLS:
+            snprintf(modeBuf, sizeof(modeBuf), "NRF T00LS");
+            modeColor = COLOR_ACCENT;
+            break;
     }
     
     // Append mood indicator
@@ -869,8 +889,14 @@ void Display::drawBottomBar() {
                 snprintf(buf, sizeof(buf), "LOCK:%s C:%02d CH:%02d", ssidShort, clients, channel);
             }
         } else {
-            // Attack mode: show D: counter
-            if (broCount > 0 && filteredCount > 0) {
+            // Attack extras: an active attack claims the stats line; show the
+            // channel the attack itself is hopping, not recon's frozen one.
+            if (OinkMode::activeAttack() != OinkMode::AttackKind::None) {
+                snprintf(buf, sizeof(buf), "%s F:%04lu CH:%02d",
+                         OinkMode::attackStatusLine(),
+                         OinkMode::attackFramesSent(),
+                         OinkMode::attackChannel());
+            } else if (broCount > 0 && filteredCount > 0) {
                 snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04lu CH:%02d BRO:%02d F:%03d", netCount, hsCount, deauthCount, channel, broCount, filteredCount);
             } else if (broCount > 0) {
                 snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04lu CH:%02d BRO:%02d", netCount, hsCount, deauthCount, channel, broCount);
@@ -912,7 +938,13 @@ void Display::drawBottomBar() {
         uint32_t samsung = PiggyBluesMode::getSamsungCount();
         uint32_t windows = PiggyBluesMode::getWindowsCount();
         char buf[48];
-        snprintf(buf, sizeof(buf), "TX:%lu A:%lu G:%lu S:%lu W:%lu", total, apple, android, samsung, windows);
+        if (PiggyBluesMode::getFloodVariant() != PiggyBluesMode::FloodVariant::All) {
+            // Variant lock active: replace one counter with the variant tag
+            snprintf(buf, sizeof(buf), "TX:%lu [%s] S:%lu W:%lu", total,
+                     PiggyBluesMode::floodVariantName(), samsung, windows);
+        } else {
+            snprintf(buf, sizeof(buf), "TX:%lu A:%lu G:%lu S:%lu W:%lu", total, apple, android, samsung, windows);
+        }
         strncpy(statsBuf, buf, sizeof(statsBuf) - 1);
         statsBuf[sizeof(statsBuf) - 1] = '\0';
         statsStr = statsBuf;

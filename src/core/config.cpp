@@ -33,13 +33,14 @@ GPSConfig Config::gpsConfig;
 MLConfig Config::mlConfig;
 WiFiConfig Config::wifiConfig;
 BLEConfig Config::bleConfig;
+IRConfig Config::irConfig;
 PersonalityConfig Config::personalityConfig;
 bool Config::initialized = false;
 static bool sdAvailable = false;
 
 // ---- Binary config blob (zero heap allocation) ----
 static constexpr uint32_t CONFIG_MAGIC   = 0x504F524B;  // 'PORK'
-static constexpr uint16_t CONFIG_VERSION = 1;
+static constexpr uint16_t CONFIG_VERSION = 2;  // v2: IR pins appended at tail
 #define CONFIG_BIN_FILE "/porkchop.dat"
 
 static const char* configBinPathSD() {
@@ -96,10 +97,14 @@ struct __attribute__((packed)) ConfigBlob {
     float    mlVulnScorerThreshold;
     uint8_t  mlAutoUpdate;
     char     mlUpdateUrl[128];
+
+    // IR (v2 tail; v1 blobs load with these zeroed and get migrated in load())
+    uint8_t  irRxPin;
+    uint8_t  irTxPin;
 };
 
 static void populateBlob(ConfigBlob& b, const GPSConfig& gps, const WiFiConfig& wifi,
-                          const BLEConfig& ble, const MLConfig& ml) {
+                          const BLEConfig& ble, const MLConfig& ml, const IRConfig& ir) {
     memset(&b, 0, sizeof(b));
     b.magic    = CONFIG_MAGIC;
     b.version  = CONFIG_VERSION;
@@ -144,6 +149,9 @@ static void populateBlob(ConfigBlob& b, const GPSConfig& gps, const WiFiConfig& 
     b.mlVulnScorerThreshold  = ml.vulnScorerThreshold;
     b.mlAutoUpdate           = ml.autoUpdate ? 1 : 0;
     strncpy(b.mlUpdateUrl, ml.updateUrl, sizeof(b.mlUpdateUrl) - 1);
+
+    b.irRxPin = ir.rxPin;
+    b.irTxPin = ir.txPin;
 }
 
 static bool writeBlobTo(fs::FS& fs, const char* path, const ConfigBlob& b) {
@@ -177,7 +185,7 @@ static bool readBlobFrom(fs::FS& fs, const char* path, ConfigBlob& b) {
 }
 
 static void extractBlob(const ConfigBlob& b, GPSConfig& gps, WiFiConfig& wifi,
-                         BLEConfig& ble, MLConfig& ml) {
+                         BLEConfig& ble, MLConfig& ml, IRConfig& ir) {
     gps.enabled        = b.gpsEnabled != 0;
     gps.source         = static_cast<GPSSource>(b.gpsSource);
     gps.rxPin          = b.gpsRxPin;
@@ -231,6 +239,44 @@ static void extractBlob(const ConfigBlob& b, GPSConfig& gps, WiFiConfig& wifi,
     ml.autoUpdate           = b.mlAutoUpdate != 0;
     strncpy(ml.updateUrl, b.mlUpdateUrl, sizeof(ml.updateUrl) - 1);
     ml.updateUrl[sizeof(ml.updateUrl) - 1] = '\0';
+
+    ir.rxPin = b.irRxPin;
+    ir.txPin = b.irTxPin;
+}
+
+// IR pins may not sit on the shared SPI bus, its chip selects, the NRF CE
+// line, or GPIO 0 (the G0 button). Everything else is fair game for a
+// soldered cap (mirrored in test/mocks/testable_functions.h).
+static bool irPinValid(uint8_t pin) {
+    switch (pin) {
+        case 0:   // G0 button / unassigned marker in migrated v1 tails
+        case 3:   // NRF CE (cap design)
+        case 5:   // NRF CSN / LoRa CS
+        case 12:  // SD CS
+        case 14:  // SPI MOSI
+        case 39:  // SPI MISO
+        case 40:  // SPI SCK
+            return false;
+        default:
+            return pin <= 48;  // ESP32-S3 GPIO ceiling
+    }
+}
+
+static void sanitizeIRConfig(IRConfig& ir) {
+    if (!irPinValid(ir.rxPin) || !irPinValid(ir.txPin)) {
+        Serial.printf("[CONFIG] IR pins invalid (rx=%u tx=%u), restoring defaults %u/%u\n",
+                      ir.rxPin, ir.txPin, IRConfig::RX_DEFAULT, IRConfig::TX_DEFAULT);
+        ir.rxPin = IRConfig::RX_DEFAULT;
+        ir.txPin = IRConfig::TX_DEFAULT;
+    }
+}
+
+// A blob needs the IR re-save when it predates v2 (tail fields are zeroed
+// garbage from the min-size read) or carries pins the denylist rejects.
+static bool blobNeedsIRMigration(const ConfigBlob& b) {
+    // != not < : a blob stamped by NEWER firmware also migrates (sanitize to
+    // known-good defaults) instead of extracting a tail we cannot interpret.
+    return b.version != CONFIG_VERSION || !irPinValid(b.irRxPin) || !irPinValid(b.irTxPin);
 }
 
 static uint16_t clampU16(uint32_t value, uint16_t minVal, uint16_t maxVal) {
@@ -611,9 +657,17 @@ bool Config::load() {
 
     // 1. Try binary from SD (current layout path)
     if (sdAvailable && readBlobFrom((fs::FS&)SD, configBinPathSD(), blob)) {
-        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
         sanitizeWiFiConfig(wifiConfig);
+        sanitizeIRConfig(irConfig);
         Serial.println("[CONFIG] Loaded binary from SD");
+        // v1 blobs must be rewritten in place as v2 (zeroed tail must not
+        // survive, and the SD copy is the primary store)
+        if (blobNeedsIRMigration(blob)) {
+            populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
+            writeBlobTo((fs::FS&)SD, configBinPathSD(), blob);
+            Serial.println("[CONFIG] Migrated config blob to v2 on SD");
+        }
         // Mirror to SPIFFS
         writeBlobTo((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob);
         return true;
@@ -622,9 +676,12 @@ bool Config::load() {
     // 1b. Try legacy binary path on SD (migration may not have moved porkchop.dat)
     if (sdAvailable && SDLayout::usingNewLayout()) {
         if (readBlobFrom((fs::FS&)SD, "/porkchop.dat", blob)) {
-            extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+            extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
             sanitizeWiFiConfig(wifiConfig);
+            sanitizeIRConfig(irConfig);
             Serial.println("[CONFIG] Loaded binary from legacy SD path, migrating...");
+            // Re-populate so a v1 blob lands as v2 with sanitized IR pins
+            populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
             // Move to new location and mirror to SPIFFS
             writeBlobTo((fs::FS&)SD, configBinPathSD(), blob);
             writeBlobTo((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob);
@@ -636,9 +693,18 @@ bool Config::load() {
 
     // 2. Try binary from SPIFFS
     if (readBlobFrom((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob)) {
-        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
         sanitizeWiFiConfig(wifiConfig);
+        sanitizeIRConfig(irConfig);
         Serial.println("[CONFIG] Loaded binary from SPIFFS");
+        if (blobNeedsIRMigration(blob)) {
+            populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
+            writeBlobTo((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob);
+            if (sdAvailable) {
+                writeBlobTo((fs::FS&)SD, configBinPathSD(), blob);
+            }
+            Serial.println("[CONFIG] Migrated config blob to v2 (SPIFFS + SD mirror)");
+        }
         return true;
     }
 
@@ -761,7 +827,7 @@ void Config::savePersonalityToSPIFFS() {
 
 bool Config::save() {
     ConfigBlob blob;
-    populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+    populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig, irConfig);
 
     Serial.printf("[CONFIG] save(): sdAvail=%d, wpaKey=%s, wigle=%s\n",
                   sdAvailable,
@@ -786,6 +852,7 @@ bool Config::createDefaultConfig() {
     wifiConfig = WiFiConfig();
     sanitizeWiFiConfig(wifiConfig);
     bleConfig = BLEConfig();
+    irConfig = IRConfig();
     return true;
 }
 

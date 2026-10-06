@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <esp_wifi.h>
+#include <M5Unified.h>
 #include <vector>
 #include <set>
 #include <atomic>
@@ -159,6 +160,35 @@ public:
     static void moveSelectionDown();
     static void confirmSelection();
     
+    // ---- Attack selector (cap extras): beacon/probe spam, hopping deauth ----
+    enum class AttackKind : uint8_t {
+        None = 0,
+        BeaconCanned,
+        BeaconRandom,
+        BeaconCustom,
+        ProbeSpam,
+        DeauthFloodHop
+    };
+    static bool attackMenuOpen() { return atkMenuOpen; }
+    static bool attackMenuTyping() { return atkMenuTyping; }
+    static uint8_t attackMenuSel() { return atkMenuSel; }
+    static uint8_t attackMenuItemCount();
+    static const char* attackMenuItemName(uint8_t i);
+    static const char* attackCustomSsid() { return atkCustomSsid; }
+    static AttackKind activeAttack() { return atkKind; }
+    static uint32_t attackFramesSent() { return atkFrames; }
+    static uint8_t attackChannel() { return atkChannel; }
+    static const char* attackStatusLine();
+    // Input hooks (driven from porkchop handleInput)
+    static void attackMenuToggle();
+    static void attackMenuClose();
+    static void attackMenuMove(int8_t delta);
+    static void attackMenuSelect();   // enter: start chosen attack / stop active
+    static void attackMenuType(char c);
+    static void attackMenuErase();
+    static void attackMenuConfirmText();
+    static void drawAttackOverlay(M5Canvas& canvas);
+    
     // BOAR BROS - network exclusion list
     static bool loadBoarBros();           // Load from SD
     static bool saveBoarBros();           // Save to SD
@@ -201,6 +231,24 @@ private:
     static DetectedClient targetClients[MAX_CLIENTS_PER_NETWORK];
     static uint8_t targetClientCount;
     static int selectionIndex;  // Cursor for network selection
+
+    // Attack selector state
+    static bool atkMenuOpen;
+    static bool atkMenuTyping;
+    static uint8_t atkMenuSel;
+    static AttackKind atkKind;
+    static uint32_t atkFrames;
+    static uint32_t atkLastFrameMs;
+    static uint8_t atkChannel;      // 1..14 hop cursor
+    static uint8_t atkSsidIdx;      // canned list cursor
+    static uint8_t atkCannedCount;
+    static char atkCustomSsid[33];
+    static uint8_t atkCustomLen;
+    static bool atkReconWasPaused;
+    static void updateAttacks();
+    static void stopAttack();
+    static void nextCannedSsid(char* out, size_t outLen);
+    static void randomSsid(char* out, size_t outLen);
     static std::atomic<uint32_t> packetCount;
     static uint32_t deauthCount;
     

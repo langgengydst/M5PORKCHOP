@@ -26,6 +26,9 @@ namespace SDLayout {
     const char* miscDir();
     const char* configDir();
     const char* metaDir();
+    // IR/NRF capture dirs: no legacy layout, always the new root
+    const char* irDir();
+    const char* nrfDir();
 
     // Files (resolved to legacy or new layout)
     const char* configPathSD();

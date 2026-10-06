@@ -26,6 +26,10 @@
 #include "../modes/pigsync_client.h"
 #include "../modes/bacon.h"
 #include "../modes/charging.h"
+#include "../modes/ir_tools.h"
+#include "../modes/nrf_tools.h"
+#include "../ui/ir_menu.h"
+#include "../ui/nrf_menu.h"
 #include "../web/fileserver.h"
 #include "../audio/sfx.h"
 #include "config.h"
@@ -66,6 +70,8 @@ static const char* modeToString(PorkchopMode mode) {
         case PorkchopMode::BACON_MODE: return "BACON";
         case PorkchopMode::SD_FORMAT: return "SD_FORMAT";
         case PorkchopMode::CHARGING: return "CHARGING";
+        case PorkchopMode::IR_TOOLS: return "IR_TOOLS";
+        case PorkchopMode::NRF_TOOLS: return "NRF_TOOLS";
         case PorkchopMode::ABOUT: return "ABOUT";
         default: return "UNKNOWN";
     }
@@ -226,6 +232,8 @@ void Porkchop::init() {
             case 19: setMode(PorkchopMode::DIAGNOSTICS); break;
             case 20: setMode(PorkchopMode::SD_FORMAT); break;
             case 21: setMode(PorkchopMode::CHARGING); break;
+            case 22: setMode(PorkchopMode::IR_TOOLS); break;
+            case 23: setMode(PorkchopMode::NRF_TOOLS); break;
         }
     });
 
@@ -416,6 +424,12 @@ void Porkchop::setMode(PorkchopMode mode) {
         case PorkchopMode::CHARGING:
             ChargingMode::stop();
             break;
+        case PorkchopMode::IR_TOOLS:
+            IrMenu::hide();
+            break;
+        case PorkchopMode::NRF_TOOLS:
+            NrfMenu::hide();
+            break;
         default:
             break;
     }
@@ -528,6 +542,14 @@ void Porkchop::setMode(PorkchopMode mode) {
         case PorkchopMode::CHARGING:
             SDLog::log("PORK", "Mode: CHARGING");
             ChargingMode::start();
+            break;
+        case PorkchopMode::IR_TOOLS:
+            SDLog::log("PORK", "Mode: IR TOOLS");
+            IrMenu::show();
+            break;
+        case PorkchopMode::NRF_TOOLS:
+            SDLog::log("PORK", "Mode: NRF TOOLS");
+            NrfMenu::show();
             break;
         default:
             break;
@@ -786,6 +808,14 @@ void Porkchop::handleInput() {
                 case 'C':
                     setMode(PorkchopMode::CHARGING);
                     break;
+                case 'i': // IR tools (cap)
+                case 'I':
+                    setMode(PorkchopMode::IR_TOOLS);
+                    break;
+                case 'n': // NRF tools (cap)
+                case 'N':
+                    setMode(PorkchopMode::NRF_TOOLS);
+                    break;
             }
         }
         yield(); // Allow other tasks to run after processing all keys
@@ -793,10 +823,56 @@ void Porkchop::handleInput() {
     
     // OINK mode - B to exclude network
     if (currentMode == PorkchopMode::OINK_MODE) {
+        // Attack selector: A opens/closes, menu keys navigate, typing edits.
+        static bool aWasPressed = false;
+        bool aPressed = M5Cardputer.Keyboard.isKeyPressed('a') || M5Cardputer.Keyboard.isKeyPressed('A');
+        if (aPressed && !aWasPressed && !OinkMode::attackMenuTyping()) {
+            OinkMode::attackMenuToggle();
+        }
+        aWasPressed = aPressed;
+
+        if (OinkMode::attackMenuOpen()) {
+            auto& akb = M5Cardputer.Keyboard;
+            if (OinkMode::attackMenuTyping()) {
+                auto keys = akb.keysState();
+                for (char c : keys.word) OinkMode::attackMenuType(c);
+                static bool atkEraseWasPressed = false;
+                bool erase = keys.backspace || keys.del;
+                if (erase && !atkEraseWasPressed) OinkMode::attackMenuErase();
+                atkEraseWasPressed = erase;
+                static bool atkTextEnterWasPressed = false;
+                bool ent = akb.isKeyPressed(KEY_ENTER);
+                if (ent && !atkTextEnterWasPressed) OinkMode::attackMenuSelect();
+                atkTextEnterWasPressed = ent;
+            } else {
+                // Per-key latches: one shared latch swallows a second key
+                // tapped while the first is still held.
+                static bool atkSemiWasPressed = false;
+                static bool atkDotWasPressed = false;
+                static bool atkEnterWasPressed = false;
+                static bool atkBsWasPressed = false;
+                bool semi = akb.isKeyPressed(';');
+                bool dot = akb.isKeyPressed('.');
+                bool ent = akb.isKeyPressed(KEY_ENTER);
+                bool bs = akb.isKeyPressed(KEY_BACKSPACE);
+                if (semi && !atkSemiWasPressed) OinkMode::attackMenuMove(-1);
+                if (dot && !atkDotWasPressed) OinkMode::attackMenuMove(+1);
+                if (ent && !atkEnterWasPressed) OinkMode::attackMenuSelect();
+                if (bs && !atkBsWasPressed) OinkMode::attackMenuClose();
+                atkSemiWasPressed = semi;
+                atkDotWasPressed = dot;
+                atkEnterWasPressed = ent;
+                atkBsWasPressed = bs;
+            }
+            // While the attack menu is up, B/D actions stay inert but their
+            // latches keep updating below, so a key held across menu close
+            // does not fire a stale edge.
+        }
+
         // B key - add selected network to BOAR BROS exclusion list
         static bool bWasPressed = false;
         bool bPressed = M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('B');
-        if (bPressed && !bWasPressed) {
+        if (bPressed && !bWasPressed && !OinkMode::attackMenuOpen()) {
             int idx = OinkMode::getSelectionIndex();
             if (OinkMode::excludeNetwork(idx)) {
                 Display::showToast("BOAR BRO ADDED!");
@@ -812,7 +888,7 @@ void Porkchop::handleInput() {
         // D key - switch to DO NO HAM mode (seamless mode switch)
         static bool dWasPressed_oink = false;
         bool dPressed = M5Cardputer.Keyboard.isKeyPressed('d') || M5Cardputer.Keyboard.isKeyPressed('D');
-        if (dPressed && !dWasPressed_oink) {
+        if (dPressed && !dWasPressed_oink && !OinkMode::attackMenuOpen()) {
             // Track passive time for achievements
             SessionStats& sess = const_cast<SessionStats&>(XP::getSession());
             sess.passiveTimeStart = millis();
@@ -828,6 +904,21 @@ void Porkchop::handleInput() {
         dWasPressed_oink = dPressed;
     }
     
+    // PIGGYBLUES mode - V cycles the flood variant between bursts
+    if (currentMode == PorkchopMode::PIGGYBLUES_MODE) {
+        static bool vWasPressed_blues = false;
+        bool vPressed = M5Cardputer.Keyboard.isKeyPressed('v') ||
+                        M5Cardputer.Keyboard.isKeyPressed('V');
+        if (vPressed && !vWasPressed_blues && PiggyBluesMode::isRunning()) {
+            PiggyBluesMode::cycleFloodVariant();
+            char toast[48];
+            snprintf(toast, sizeof(toast), "FLOOD: %s",
+                     PiggyBluesMode::floodVariantName());
+            Display::showToast(toast);
+        }
+        vWasPressed_blues = vPressed;
+    }
+
     // DNH mode - O key to switch back to OINK
     if (currentMode == PorkchopMode::DNH_MODE) {
         // O key - switch back to OINK mode (seamless mode switch)
@@ -974,6 +1065,18 @@ void Porkchop::updateMode() {
             ChargingMode::update();
             if (ChargingMode::shouldExit()) {
                 setMode(PorkchopMode::IDLE);
+            }
+            break;
+        case PorkchopMode::IR_TOOLS:
+            IrMenu::update();
+            if (!IrMenu::isActive()) {
+                setMode(PorkchopMode::MENU);
+            }
+            break;
+        case PorkchopMode::NRF_TOOLS:
+            NrfMenu::update();
+            if (!NrfMenu::isActive()) {
+                setMode(PorkchopMode::MENU);
             }
             break;
         default:

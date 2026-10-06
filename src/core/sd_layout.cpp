@@ -30,6 +30,10 @@ static constexpr const char* kNewXp = "/m5porkchop/xp";
 static constexpr const char* kNewMisc = "/m5porkchop/misc";
 static constexpr const char* kNewConfig = "/m5porkchop/config";
 static constexpr const char* kNewMeta = "/m5porkchop/meta";
+// No legacy equivalents: IR/NRF captures postdate the v1 layout, so they
+// always live under the new root even on not-yet-migrated devices.
+static constexpr const char* kNewIr = "/m5porkchop/ir";
+static constexpr const char* kNewNrf = "/m5porkchop/nrf";
 
 static constexpr const char* kLegacyConfig = "/porkchop.conf";
 static constexpr const char* kLegacyPersonality = "/personality.json";
@@ -448,6 +452,8 @@ const char* xpDir() { return usingNewLayout() ? kNewXp : "/"; }
 const char* miscDir() { return usingNewLayout() ? kNewMisc : "/"; }
 const char* configDir() { return usingNewLayout() ? kNewConfig : "/"; }
 const char* metaDir() { return usingNewLayout() ? kNewMeta : "/"; }
+const char* irDir() { return kNewIr; }
+const char* nrfDir() { return kNewNrf; }
 
 const char* configPathSD() { return usingNewLayout() ? kNewConfigPath : kLegacyConfig; }
 const char* personalityPathSD() { return usingNewLayout() ? kNewPersonalityPath : kLegacyPersonality; }
@@ -520,6 +526,11 @@ void ensureDirs() {
         if (!SD.exists(kLegacyWardriving)) SD.mkdir(kLegacyWardriving);
         if (!SD.exists(kLegacyModels)) SD.mkdir(kLegacyModels);
         if (!SD.exists(kLegacyLogs)) SD.mkdir(kLegacyLogs);
+        // IR/NRF captures have no legacy home; create their new-layout dirs
+        // so first capture never fails on a not-yet-migrated device.
+        ensureDir(kNewRoot);
+        ensureDir(kNewIr);
+        ensureDir(kNewNrf);
         return;
     }
 
@@ -537,6 +548,8 @@ void ensureDirs() {
     ensureDir(kNewMisc);
     ensureDir(kNewConfig);
     ensureDir(kNewMeta);
+    ensureDir(kNewIr);
+    ensureDir(kNewNrf);
 }
 
 bool migrateIfNeeded() {

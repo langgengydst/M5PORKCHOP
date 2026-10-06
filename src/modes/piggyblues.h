@@ -39,6 +39,14 @@ public:
     static uint32_t getAndroidCount() { return androidCount; }
     static uint32_t getSamsungCount() { return samsungCount; }
     static uint32_t getWindowsCount() { return windowsCount; }
+
+    // Flood variant selector (applied between bursts, never mid-advertise):
+    // All = current target-weighted chaos, SourApple = Apple-only,
+    // SwiftPair = Windows-only.
+    enum class FloodVariant : uint8_t { All = 0, SourApple, SwiftPair };
+    static FloodVariant getFloodVariant() { return floodVariant; }
+    static void cycleFloodVariant();
+    static const char* floodVariantName();
     
     // Vendor identification (public for callback use)
     static BLEVendor identifyVendor(const uint8_t* mfgData, size_t len);
@@ -65,6 +73,9 @@ private:
     static uint32_t androidCount;
     static uint32_t samsungCount;
     static uint32_t windowsCount;
+
+    // Flood variant
+    static FloodVariant floodVariant;
 
     // BLE state synchronization helpers
     static bool getAdvertisingNow();

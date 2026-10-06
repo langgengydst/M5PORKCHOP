@@ -109,6 +109,14 @@ struct BLEConfig {
     uint16_t advDuration = 100;         // ms per advertisement (50-200)
 };
 
+// IR settings for IR TOOLS mode (cap VS1838B receiver + G44 transmitter)
+struct IRConfig {
+    static constexpr uint8_t RX_DEFAULT = 4;    // VS1838B data pin (active-low)
+    static constexpr uint8_t TX_DEFAULT = 44;   // IR LED pin (smoke-test gated)
+    uint8_t rxPin = RX_DEFAULT;
+    uint8_t txPin = TX_DEFAULT;
+};
+
 // Personality
 struct PersonalityConfig {
     char name[32] = "Porkchop";
@@ -147,6 +155,7 @@ public:
     static MLConfig& ml() { return mlConfig; }
     static WiFiConfig& wifi() { return wifiConfig; }
     static BLEConfig& ble() { return bleConfig; }
+    static IRConfig& ir() { return irConfig; }
     static PersonalityConfig& personality() { return personalityConfig; }
     
     // Setters with auto-save
@@ -161,6 +170,7 @@ private:
     static MLConfig mlConfig;
     static WiFiConfig wifiConfig;
     static BLEConfig bleConfig;
+    static IRConfig irConfig;
     static PersonalityConfig personalityConfig;
     static bool initialized;
     

@@ -62,6 +62,8 @@ uint32_t PiggyBluesMode::appleCount = 0;
 uint32_t PiggyBluesMode::androidCount = 0;
 uint32_t PiggyBluesMode::samsungCount = 0;
 uint32_t PiggyBluesMode::windowsCount = 0;
+PiggyBluesMode::FloodVariant PiggyBluesMode::floodVariant =
+    PiggyBluesMode::FloodVariant::All;
 
 // BLE state synchronization
 static portMUX_TYPE bleStateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -940,6 +942,20 @@ void PiggyBluesMode::sendWindowsSwiftPair() {
 }
 
 void PiggyBluesMode::sendRandomPayload() {
+    // Flood variant lock: applied only at burst start (this call), never
+    // mid-advertise, so the cached pAdvertising object is never touched live.
+    if (floodVariant == FloodVariant::SourApple) {
+        lastVendorUsed = BLEVendor::APPLE;
+        lastRssiUsed = 0;
+        sendAppleJuice();
+        return;
+    }
+    if (floodVariant == FloodVariant::SwiftPair) {
+        lastVendorUsed = BLEVendor::WINDOWS;
+        lastRssiUsed = 0;
+        sendWindowsSwiftPair();
+        return;
+    }
     // If we have active targets, weight payloads toward detected vendors
     // Otherwise pure random chaos
     // NOTE: targets is sorted by RSSI, activeCount = number of "active" targets at front
@@ -980,5 +996,25 @@ void PiggyBluesMode::sendRandomPayload() {
         case 1: sendAndroidFastPair(); break;
         case 2: sendSamsungSpam(); break;
         case 3: sendWindowsSwiftPair(); break;
+    }
+}
+
+void PiggyBluesMode::cycleFloodVariant() {
+    switch (floodVariant) {
+        case FloodVariant::All:        floodVariant = FloodVariant::SourApple; break;
+        case FloodVariant::SourApple:  floodVariant = FloodVariant::SwiftPair; break;
+        case FloodVariant::SwiftPair:
+        default:                       floodVariant = FloodVariant::All; break;
+    }
+    // The new variant takes effect at the NEXT burst start, by design.
+    Serial.printf("[BLUES] flood variant -> %s\n", floodVariantName());
+}
+
+const char* PiggyBluesMode::floodVariantName() {
+    switch (floodVariant) {
+        case FloodVariant::SourApple: return "SOUR APPLE";
+        case FloodVariant::SwiftPair: return "SWIFT PAIR";
+        case FloodVariant::All:
+        default:                      return "ALL (CHAOS)";
     }
 }

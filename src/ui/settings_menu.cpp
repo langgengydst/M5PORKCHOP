@@ -1133,7 +1133,7 @@ void SettingsMenu::handleTextInput() {
     }
 
     bool hasPrintable = !keys.word.empty();
-    bool hasActionKey = keys.enter || keys.del;
+    bool hasActionKey = keys.enter || keys.backspace || keys.del;
 
     if (!hasPrintable && !hasActionKey) {
         return;
@@ -1156,7 +1156,7 @@ void SettingsMenu::handleTextInput() {
         return;
     }
 
-    if (keys.del) {
+    if (keys.backspace || keys.del) {
         if (textLen > 0) {
             textBuffer[--textLen] = '\0';
         }

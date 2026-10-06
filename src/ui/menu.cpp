@@ -52,6 +52,16 @@ static const char* const H_BLUES[] = {
     "BECAUSE SILENCE IS FOR WELL-ADJUSTED.",
     "I OPTIMIZED IT. NOW IT FAILS FASTER."
 };
+static const char* const H_IRTOOLS[] = {
+    "LIGHT BULBS. OBEY THE PIG.",
+    "CAPTURE THE REMOTE. RULE THE COUCH.",
+    "INFRARED. INFRARED-ER. INFRAREST."
+};
+static const char* const H_NRF[] = {
+    "2.4GHZ SNOUT RADIO. OWN LAB ONLY.",
+    "SMALL RADIO. BIG REGRET.",
+    "PINGS FOR PIGS. PACKETS FOR PASTE."
+};
 static const char* const H_DNOHAM[] = {
     "DO NO HAM. ZERO TX. PURE POVERTY.",
     "PASSIVE MODE: MY WILL TO DEBUG.",
@@ -162,7 +172,9 @@ const uint8_t Menu::ROOT_COUNT = sizeof(ROOT_ITEMS) / sizeof(ROOT_ITEMS[0]);
 // Group: ATTACK - offensive TX operations
 const MenuItem Menu::GROUP_ATTACK[] = {
     {"/>", "OINKS",  1,  H_OINK,   (uint8_t)(sizeof(H_OINK)/sizeof(H_OINK[0]))},
-    {"!!", "BLUES", 8,  H_BLUES,  (uint8_t)(sizeof(H_BLUES)/sizeof(H_BLUES[0]))}
+    {"!!", "BLUES", 8,  H_BLUES,  (uint8_t)(sizeof(H_BLUES)/sizeof(H_BLUES[0]))},
+    {"^^", "IRTOOL", 22, H_IRTOOLS, (uint8_t)(sizeof(H_IRTOOLS)/sizeof(H_IRTOOLS[0]))},
+    {">>", "NRFTOOL", 23, H_NRF,    (uint8_t)(sizeof(H_NRF)/sizeof(H_NRF[0]))}
 };
 const uint8_t Menu::GROUP_ATTACK_SIZE = sizeof(GROUP_ATTACK) / sizeof(GROUP_ATTACK[0]);
 

